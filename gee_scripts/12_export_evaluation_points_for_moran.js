@@ -1,0 +1,258 @@
+/*
+Export evaluation points for spatial autocorrelation analysis in Python
+
+This script:
+1. Loads a previously generated classified raster
+2. Loads the external evaluation point dataset
+3. Standardizes class labels and maps them to class IDs
+4. Extracts raster predictions at evaluation points
+5. Computes standard accuracy metrics
+6. Exports point coordinates, observed class, predicted class, and error labels
+   for downstream Moran's I analysis in Python
+
+Exports:
+- Eval_points_Moran_<SETUP>_<YEAR>.csv
+
+Notes:
+- The classified raster must contain a band named 'class_id'
+- The exported table is intended for spatial autocorrelation analyses of
+  classification errors in Python
+*/
+
+var YEAR = 2023;
+var SETUP_NAME = 'S2_DEM_PHENO';
+var SCALE = 10;
+
+var DRIVE_FOLDER_MORAN = 'moran_exports';
+
+
+// ---------------------------------------------------------------------
+// 1. Study area
+// ---------------------------------------------------------------------
+var studyArea = ee.FeatureCollection('projects/your_project/assets/study_area')
+  .geometry()
+  .dissolve();
+
+
+// ---------------------------------------------------------------------
+// 2. Class definitions
+// ---------------------------------------------------------------------
+var ALLOWED_CLASS_IDS = [1, 2, 3, 4, 5, 6];
+var classIds = ee.List(ALLOWED_CLASS_IDS);
+
+var CLASS_MAP = ee.Dictionary({
+  'rocky_grassland': 1,
+  'grassland': 2,
+  'cropland': 3,
+  'water': 4,
+  'urban': 5,
+  'forest_plantation': 6
+});
+
+var CLASS_NAMES = ee.Dictionary({
+  1: 'rocky_grassland',
+  2: 'grassland',
+  3: 'cropland',
+  4: 'water',
+  5: 'urban',
+  6: 'forest_plantation'
+});
+
+
+// ---------------------------------------------------------------------
+// 3. Input datasets
+// ---------------------------------------------------------------------
+var classifiedAsset =
+  'projects/your_project/assets/CLS_' + SETUP_NAME + '_' + YEAR + '_RF_final';
+
+var evaluationPointsAsset =
+  'projects/your_project/assets/external_evaluation_points';
+
+var evaluationClassProperty = 'class';
+
+
+// ---------------------------------------------------------------------
+// 4. Load classified raster
+// ---------------------------------------------------------------------
+var classifiedRaster = ee.Image(classifiedAsset)
+  .select(['class_id'])
+  .rename('prediction')
+  .toInt16()
+  .clip(studyArea);
+
+
+// ---------------------------------------------------------------------
+// 5. Load and clean evaluation points
+// ---------------------------------------------------------------------
+function normalizeClassLabel(classValue) {
+  classValue = ee.String(classValue).trim().toLowerCase();
+
+  classValue = classValue
+    .replace('á', 'a')
+    .replace('é', 'e')
+    .replace('í', 'i')
+    .replace('ó', 'o')
+    .replace('ú', 'u');
+
+  classValue = ee.String(
+    ee.Algorithms.If(
+      classValue.equals('rocky grassland'),
+      'rocky_grassland',
+      classValue
+    )
+  );
+
+  classValue = ee.String(
+    ee.Algorithms.If(
+      classValue.equals('forestall'),
+      'forest_plantation',
+      classValue
+    )
+  );
+
+  return classValue;
+}
+
+
+var rawEvaluationPoints = ee.FeatureCollection(evaluationPointsAsset)
+  .filterBounds(studyArea);
+
+var evaluationPoints = rawEvaluationPoints
+  .map(function(feature) {
+    var hasClass = feature.propertyNames().contains(evaluationClassProperty);
+
+    var classLabel = ee.String(
+      ee.Algorithms.If(hasClass, feature.get(evaluationClassProperty), '')
+    );
+
+    classLabel = normalizeClassLabel(classLabel);
+
+    var classId = ee.Number(
+      ee.Algorithms.If(
+        CLASS_MAP.contains(classLabel),
+        CLASS_MAP.get(classLabel),
+        -99
+      )
+    );
+
+    return ee.Feature(feature.geometry(), {
+      class_id: classId
+    });
+  })
+  .filter(ee.Filter.neq('class_id', -99))
+  .filter(ee.Filter.inList('class_id', classIds));
+
+
+// ---------------------------------------------------------------------
+// 6. Sample predictions at evaluation points
+// ---------------------------------------------------------------------
+var sampledPoints = classifiedRaster.sampleRegions({
+  collection: evaluationPoints,
+  properties: ['class_id'],
+  scale: SCALE,
+  geometries: true
+}).filter(ee.Filter.notNull(['prediction']));
+
+var validSampledPoints = sampledPoints.filter(
+  ee.Filter.inList('prediction', classIds)
+);
+
+
+// ---------------------------------------------------------------------
+// 7. Compute standard accuracy metrics
+// ---------------------------------------------------------------------
+var confusionMatrix = validSampledPoints.errorMatrix(
+  'class_id',
+  'prediction',
+  classIds
+);
+
+var overallAccuracy = confusionMatrix.accuracy();
+var kappa = confusionMatrix.kappa();
+
+
+function flattenAccuracyArray(arrayLike) {
+  return ee.List(ee.Array(arrayLike).toList()).flatten();
+}
+
+var producerAccuracy = flattenAccuracyArray(confusionMatrix.producersAccuracy());
+var userAccuracy = flattenAccuracyArray(confusionMatrix.consumersAccuracy());
+
+var f1PerClass = ee.List.sequence(0, classIds.length().subtract(1)).map(function(i) {
+  i = ee.Number(i);
+
+  var recall = ee.Number(producerAccuracy.get(i));
+  var precision = ee.Number(userAccuracy.get(i));
+  var denominator = precision.add(recall);
+
+  return ee.Number(
+    ee.Algorithms.If(
+      denominator.neq(0),
+      precision.multiply(recall).multiply(2).divide(denominator),
+      0
+    )
+  );
+});
+
+var macroF1 = ee.Number(f1PerClass.reduce(ee.Reducer.mean()));
+
+
+// ---------------------------------------------------------------------
+// 8. Build export table for Moran's I
+// ---------------------------------------------------------------------
+var pointsForMoran = validSampledPoints.map(function(feature) {
+  var coordinates = feature.geometry().coordinates();
+
+  var observedClass = ee.Number(feature.get('class_id'));
+  var predictedClass = ee.Number(feature.get('prediction'));
+  var error = observedClass.neq(predictedClass);
+
+  return feature.set({
+    x: ee.List(coordinates).get(0),
+    y: ee.List(coordinates).get(1),
+    pred: predictedClass,
+    error: ee.Number(error),
+    correct: ee.Number(observedClass.eq(predictedClass))
+  });
+});
+
+
+// ---------------------------------------------------------------------
+// 9. Optional per-class summary
+// ---------------------------------------------------------------------
+var perClassTable = classIds.map(function(classId) {
+  classId = ee.Number(classId);
+  var index = classIds.indexOf(classId);
+
+  return ee.Feature(null, {
+    class_id: classId,
+    class_name: CLASS_NAMES.get(classId),
+    producer_accuracy: producerAccuracy.get(index),
+    user_accuracy: userAccuracy.get(index),
+    f1_score: f1PerClass.get(index)
+  });
+});
+
+
+// ---------------------------------------------------------------------
+// 10. Export Moran table
+// ---------------------------------------------------------------------
+Export.table.toDrive({
+  collection: pointsForMoran,
+  description: 'Eval_points_Moran_' + SETUP_NAME + '_' + YEAR,
+  folder: DRIVE_FOLDER_MORAN,
+  fileNamePrefix: 'Eval_points_Moran_' + SETUP_NAME + '_' + YEAR,
+  fileFormat: 'CSV',
+  selectors: ['x', 'y', 'class_id', 'pred', 'error', 'correct']
+});
+
+
+// ---------------------------------------------------------------------
+// 11. Print summary
+// ---------------------------------------------------------------------
+print('Confusion matrix:', confusionMatrix);
+print('Overall Accuracy:', overallAccuracy);
+print('Kappa:', kappa);
+print('Macro-F1:', macroF1);
+print('Per-class metrics:', ee.FeatureCollection(perClassTable));
+print('Moran input table prepared. Run the export task from the Tasks tab.');
